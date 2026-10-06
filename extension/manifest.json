@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "PDP Compact HTML Finder",
+  "version": "5.2.9",
+  "description": "v5.2.9 anti-bot upgrade: session breaks every 20 items, human-like scrolling before capture, exponential backoff on denials, wider delay jitter. Carries the 5.2.8 HEB challenge-page fix and 5.2.7 CVS sibling-variant fix.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "downloads",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "PDP Compact HTML Finder",
+    "default_popup": "popup.html"
+  }
+}
