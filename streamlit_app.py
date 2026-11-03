@@ -1844,6 +1844,9 @@ def prepare_input_df(df):
             or "sp-schema" in lowered
             or "/bizcontent/merchandising/productimages/high_res/" in lowered
             or "schema.org" in lowered
+            or "images.albertsons-media.com" in lowered
+            or "detailsaccordioncontent" in lowered
+            or "product-details__info" in lowered
         )
 
     core_columns_for_source_scan = {
@@ -3391,6 +3394,16 @@ def parse_uploaded_raw_html_map(raw_text, selected_retailer=""):
             capture_rpc = re.sub(r"[^0-9A-Za-z_-]", "", str(capture_rpc_match.group(1) or "").strip()) if capture_rpc_match else ""
             if capture_rpc:
                 keys.append(f"cvs_rpc::{capture_rpc}")
+        if requested_url and any(domain in requested_url.lower() for domain in ("albertsons.com", "jewelosco.com", "safeway.com")):
+            alb_rpcs = []
+            for url_value in (requested_url, final_url_from_payload):
+                alb_rpc = _albertsons_rpc_from_url(url_value)
+                if alb_rpc:
+                    alb_rpcs.append(alb_rpc)
+            for rpc_line in re.findall(r"(?im)^(?:RPC|Search Term|Retailer RPC)\s*:\s*(\d{5,})\s*$", block):
+                alb_rpcs.append(rpc_line)
+            for alb_rpc in dedupe_preserve_order(alb_rpcs):
+                keys.append(f"albertsons_rpc::{alb_rpc}")
         for key in dedupe_preserve_order(keys):
             html_map[key] = html_text
 
@@ -3920,6 +3933,25 @@ def lookup_uploaded_raw_html(uploaded_html_map, retail_url, target_rpc=""):
         html_text = str(uploaded_html_map.get(key, "") or "")
         if html_text:
             return html_text
+        return ""
+
+    if (
+        (retail_url and any(d in retail_url.lower() for d in ("albertsons.com", "jewelosco.com", "safeway.com")))
+        or (target_rpc and any(str(k).startswith("albertsons_rpc::") for k in uploaded_html_map.keys()))
+    ):
+        alb_rpcs = []
+        for value in (target_rpc, _albertsons_rpc_from_url(retail_url)):
+            digits = re.sub(r"[^0-9]", "", str(value or ""))
+            if digits and digits not in alb_rpcs:
+                alb_rpcs.append(digits)
+        for rpc in alb_rpcs:
+            html_text = str(uploaded_html_map.get(f"albertsons_rpc::{rpc}", "") or "")
+            if html_text:
+                return html_text
+        for key in uploaded_capture_url_candidates(retail_url):
+            html_text = str(uploaded_html_map.get(key, "") or "")
+            if html_text:
+                return html_text
         return ""
 
     if not retail_url and target_rpc:
@@ -4860,7 +4892,57 @@ def _parse_salsify_page(html_text):
     heb_feature_values = normalize_salsify_feature_values(dedupe_preserve_order(heb_feature_values), max_features=10)
 
 
+    albertsons_feature_values = []
+    albertsons_feature_slots = {}
+    for i in range(1, 11):
+        alb_exact_values = collect_property_values(
+            f"Albertsons Feature {i}", f"Albertsons Feature{i}",
+            f"Albertsons Bullet {i}", f"Albertsons Bullet{i}",
+            f"Retailer Feature {i} - Albertsons", f"Retailer Bullet {i} - Albertsons",
+        )
+        alb_slot_values = [v for v in dedupe_preserve_order(alb_exact_values or []) if v and not is_placeholder_salsify_copy_value(v)]
+        if alb_slot_values:
+            albertsons_feature_slots[i] = alb_slot_values[0]
+            albertsons_feature_values.extend(alb_slot_values)
+    albertsons_feature_values = normalize_salsify_feature_values(dedupe_preserve_order(albertsons_feature_values), max_features=10)
+
+    other_retailer_tokens = (
+        "cvs", "kroger", "walgreens", "sams", "sam s", "heb", "h e b", "walmart", "target",
+        "amazon", "meijer", "instacart", "doordash", "shoppers", "safeway", "jewel",
+    )
+
+    def scan_non_placeholder_value(required_token, excluded_tokens=()):
+        """Last-resort Salsify scan: first real (non-placeholder) value on a property whose key has required_token."""
+        for prop_key, values in property_values.items():
+            pk = normalize_space(prop_key).lower().replace("_", " ")
+            if required_token not in pk:
+                continue
+            if any(tok in pk for tok in excluded_tokens):
+                continue
+            for value in values or []:
+                clean_value = normalize_space(value)
+                if clean_value and len(clean_value) >= 10 and not is_placeholder_salsify_copy_value(clean_value):
+                    return clean_value
+        return ""
+
+    albertsons_title = first_non_placeholder_copy_value(
+        first_property("Albertsons Product Title", "Albertsons Title", "Albertsons Product Name"),
+        first_property("General Product Title", "General Title", "Product Title"),
+        scan_non_placeholder_value("title", other_retailer_tokens + ("meta", "seo", "subtitle")),
+    )
+    albertsons_description = first_non_placeholder_copy_value(
+        first_property("Albertsons Description", "Albertsons Product Description", "Albertsons Long Description"),
+        first_property("General Description", "General Product Description", "Description"),
+        scan_non_placeholder_value("description", other_retailer_tokens + ("meta", "seo", "short", "image", "alt")),
+    )
+
     retailer_overrides = {
+        "albertsons": {
+            "title": albertsons_title,
+            "description": albertsons_description,
+            "features": normalize_salsify_feature_values(albertsons_feature_values or general_feature_values, max_features=10),
+            "feature_slots": albertsons_feature_slots,
+        },
         "kroger": {
             "title": first_property("Kroger Product Title", "Kroger Title"),
             "description": first_property("Kroger Description", "Kroger Product Description"),
@@ -11554,22 +11636,65 @@ def clean_albertsons_text(value):
     return normalize_space(value)
 
 
+def _albertsons_unescape(value):
+    """Unescape entity-encoded captures (&lt;div ...) until real tags appear."""
+    working = str(value or "")
+    for _ in range(4):
+        nxt = html.unescape(working)
+        if nxt == working:
+            break
+        working = nxt
+    return working
+
+
+def _albertsons_rpc_from_url(value):
+    match = re.search(r"product-details\.(\d{5,})", str(value or ""), flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+ALBERTSONS_URL_DOMAINS = ("albertsons.com", "jewelosco.com", "safeway.com")
+
+
+def _albertsons_title_from_alt(soup):
+    for selector in ("img.product-image__thumbnail-icon[alt]", "img.product-image__responsive[alt]", ".product-image img[alt]"):
+        for node in soup.select(selector):
+            alt = clean_albertsons_text(node.get("alt", ""))
+            alt = re.sub(r"\s*-\s*Image\s*\d+\s*$", "", alt, flags=re.IGNORECASE).strip()
+            if alt and len(alt) >= 8:
+                return alt
+    return ""
+
+
 def extract_albertsons_text_from_html(html_text, retail_url="", target_rpc=""):
     debug = {"Title Path": "", "Description Path": "", "Features Path": "", "Rating Path": "", "Source Used": "uploaded_txt_raw_html", "Retailer": "Albertsons"}
     if not html_text:
         return {"title": "", "description": "", "features": [], "rating": "", "review_count": "", "debug": debug}
-    working = html.unescape(str(html_text or ""))
+    working = _albertsons_unescape(html_text)
     soup = BeautifulSoup(working, "html.parser")
     product = _albertsons_product_jsonld(soup, target_rpc=target_rpc)
+    rpc_digits = re.sub(r"[^0-9]", "", str(target_rpc or "")) or _albertsons_rpc_from_url(retail_url)
+    blocked_titles = {"shopped with us before?", "welcome back!", "sign in", "create account"}
 
     title = clean_albertsons_text(product.get("name", ""))
     if title:
         debug["Title Path"] = "albertsons_jsonld_product_name"
+    if not title and rpc_digits:
+        # Current Albertsons PDP: <div class="heading-s" role="heading" aria-level="1" id="<RPC>">Title</div>
+        node = soup.select_one(f'[role="heading"][id="{rpc_digits}"]') or soup.select_one(f'.product-details__info [id="{rpc_digits}"]')
+        value = clean_albertsons_text(node.get_text(" ", strip=True)) if node else ""
+        if value and value.lower() not in blocked_titles:
+            title = value
+            debug["Title Path"] = "albertsons_dom_heading_id_rpc"
     if not title:
-        for selector in ('h1.heading-s', 'h1.product-title', '[data-testid="product-title"]', 'h1'):
+        for selector in (
+            '.product-details__info [role="heading"][aria-level="1"]',
+            'div.heading-s[role="heading"][aria-level="1"]',
+            '[role="heading"][aria-level="1"]',
+            'h1.heading-s', 'h1.product-title', '[data-testid="product-title"]', 'h1',
+        ):
             node = soup.select_one(selector)
             value = clean_albertsons_text(node.get_text(" ", strip=True)) if node else ""
-            if value and value.lower() not in {"shopped with us before?", "welcome back!"}:
+            if value and value.lower() not in blocked_titles:
                 title = value
                 debug["Title Path"] = f"albertsons_dom_{selector}"
                 break
@@ -11578,9 +11703,15 @@ def extract_albertsons_text_from_html(html_text, retail_url="", target_rpc=""):
         title = clean_albertsons_text(meta.get("content", "")) if meta else ""
         if title:
             debug["Title Path"] = "albertsons_og_title"
+    if not title:
+        title = _albertsons_title_from_alt(soup)
+        if title:
+            debug["Title Path"] = "albertsons_image_alt"
+    if not title:
+        debug["Title Path"] = "albertsons_title_missing"
 
     details = None
-    for selector in ('#detailsAccordionContent', '[data-testid="product-detail-accordion"]', '.product-details__description'):
+    for selector in ('#detailsAccordionContent', '[data-testid="product-detail-accordion"]', '.content-detail__marketing', '.product-details__description'):
         details = soup.select_one(selector)
         if details:
             break
@@ -11591,12 +11722,24 @@ def extract_albertsons_text_from_html(html_text, retail_url="", target_rpc=""):
             value = clean_albertsons_text(li.get_text(" ", strip=True))
             if value and len(value) >= 8:
                 features.append(value)
-        clone = BeautifulSoup(str(details), "html.parser")
-        for li in clone.select("li"):
-            li.decompose()
-        description = clean_albertsons_text(clone.get_text(" ", strip=True))
-        if description:
-            debug["Description Path"] = "albertsons_details_accordion"
+        marketing = details.select_one(".content-detail__marketing") or details
+        # Description = the marketing paragraph above the bullets (div.pt-4). The short
+        # product-name line under the bullets is not part of the description.
+        for node in marketing.select("div.pt-4"):
+            if node.find("li"):
+                continue
+            value = clean_albertsons_text(node.get_text(" ", strip=True))
+            if len(value) >= 40:
+                description = value
+                debug["Description Path"] = "albertsons_details_marketing_div"
+                break
+        if not description:
+            clone = BeautifulSoup(str(details), "html.parser")
+            for tag in clone.select("ul, ol, li"):
+                tag.decompose()
+            description = clean_albertsons_text(clone.get_text(" ", strip=True))
+            if description:
+                debug["Description Path"] = "albertsons_details_accordion"
         if features:
             debug["Features Path"] = "albertsons_details_accordion_li"
     if not description:
@@ -11606,8 +11749,13 @@ def extract_albertsons_text_from_html(html_text, retail_url="", target_rpc=""):
     if not description:
         meta = soup.find("meta", attrs={"property": "og:description"}) or soup.find("meta", attrs={"name": "description"})
         description = clean_albertsons_text(meta.get("content", "")) if meta else ""
+        # Albertsons' generic SEO meta ("Shop X from albertsons. Browse our wide selection...") is not product copy.
+        if re.match(r"(?is)^shop\b.*\bbrowse our wide selection\b", description or ""):
+            description = ""
         if description:
             debug["Description Path"] = "albertsons_meta_description"
+    if not description:
+        debug["Description Path"] = "albertsons_description_missing"
 
     bad_markers = ("chicken wings", "create account", "my account", "shopping options for", "change zip")
     features = [x for x in dedupe_preserve_order(features) if not any(m in x.lower() for m in bad_markers)][:10]
@@ -11623,7 +11771,8 @@ def extract_albertsons_text_from_html(html_text, retail_url="", target_rpc=""):
 
 
 def _normalize_albertsons_image_url(url):
-    url = html.unescape(str(url or "").strip()).replace("\\/", "/")
+    url = html.unescape(str(url or "").strip()).replace("\\/", "/").replace("\\u0026", "&")
+    url = url.strip(" \"'()[],;")
     if url.startswith("//"):
         url = "https:" + url
     if not url.lower().startswith(("http://", "https://")):
@@ -11631,14 +11780,26 @@ def _normalize_albertsons_image_url(url):
     if "images.albertsons-media.com/is/image/ABS/" not in url:
         return ""
     url = re.sub(r"\?(?:\$ng-ecom-[^&]+\$)?&?defaultImage=Not_Available.*$", "", url, flags=re.IGNORECASE)
+    url = re.sub(r"\?\$ng-ecom-[^&]+\$$", "", url, flags=re.IGNORECASE)
     return url.rstrip("?&")
 
 
 def extract_albertsons_images_from_html(html_text, target_rpc=""):
-    working = html.unescape(str(html_text or ""))
+    working = _albertsons_unescape(html_text)
     soup = BeautifulSoup(working, "html.parser")
     product = _albertsons_product_jsonld(soup, target_rpc=target_rpc)
     values = []
+    # 1. Thumbnail strip in site order (all thumbnails are in the DOM, even the hidden ones).
+    for node in soup.select("img.product-image__thumbnail-icon"):
+        values.append(node.get("src", "") or node.get("data-src", ""))
+    # 2. Hero image.
+    for node in soup.select("img.product-image__responsive, .product-image__hero-desktop img"):
+        values.append(node.get("src", "") or node.get("data-src", ""))
+    for node in soup.select(".product-image__hero-desktop[style]"):
+        match = re.search(r"url\(([^)]+)\)", node.get("style", "") or "")
+        if match:
+            values.append(match.group(1))
+    # 3. Structured data / meta / any other ABS image tag.
     image_value = product.get("image", [])
     values.extend(image_value if isinstance(image_value, list) else [image_value])
     og = soup.find("meta", attrs={"property": "og:image"})
@@ -11646,14 +11807,18 @@ def extract_albertsons_images_from_html(html_text, target_rpc=""):
         values.append(og.get("content", ""))
     for node in soup.select('img[src*="images.albertsons-media.com/is/image/ABS/"]'):
         values.append(node.get("src", ""))
-    values.extend(re.findall(r"https?://images\.albertsons-media\.com/is/image/ABS/[^\s\"'<>\)]+", working, flags=re.IGNORECASE))
+    values.extend(re.findall(r"(?:https?:)?//images\.albertsons-media\.com/is/image/ABS/[^\s\"'<>\)]+", working, flags=re.IGNORECASE))
     target_rpc = re.sub(r"[^0-9]", "", str(target_rpc or ""))
+    if not target_rpc:
+        heading = soup.select_one('[role="heading"][aria-level="1"][id]')
+        heading_id = re.sub(r"[^0-9]", "", str(heading.get("id", "") if heading else ""))
+        target_rpc = heading_id if len(heading_id) >= 5 else ""
     out, seen = [], set()
     for value in values:
         url = _normalize_albertsons_image_url(value)
         if not url:
             continue
-        if target_rpc and f"/ABS/{target_rpc}-" not in url and f"/ABS/{target_rpc}?" not in url:
+        if target_rpc and f"/ABS/{target_rpc}-" not in url and f"/ABS/{target_rpc}?" not in url and not url.endswith(f"/ABS/{target_rpc}"):
             continue
         key = url.split("?", 1)[0]
         if key not in seen:
@@ -11665,10 +11830,32 @@ def extract_albertsons_images_from_html(html_text, target_rpc=""):
 @st.cache_data(show_spinner=False, max_entries=1200)
 def get_albertsons_bundle(retail_url, target_rpc="", sku=""):
     html_text = get_html(retail_url) if retail_url else ""
-    return {
+    bundle = {
         "text": extract_albertsons_text_from_html(html_text, retail_url=retail_url, target_rpc=target_rpc),
         "images": extract_albertsons_images_from_html(html_text, target_rpc=target_rpc),
     }
+    debug = bundle["text"].setdefault("debug", {})
+    debug["Source Used"] = "albertsons_live_html" if html_text else "albertsons_live_fetch_empty_or_blocked"
+    debug["Albertsons Live HTML Length"] = len(str(html_text or ""))
+    return bundle
+
+
+def find_albertsons_url_in_uploaded_map(uploaded_html_map, target_rpc=""):
+    """Return the captured Albertsons PDP URL for an RPC (URL keys only, never ::-keys)."""
+    rpc = re.sub(r"[^0-9]", "", str(target_rpc or ""))
+    if not rpc:
+        return ""
+    best = ""
+    for key in (uploaded_html_map or {}).keys():
+        key_str = str(key or "")
+        if "::" in key_str or not key_str.lower().startswith("http"):
+            continue
+        if _albertsons_rpc_from_url(key_str) == rpc:
+            return key_str
+        if not best and rpc in key_str:
+            best = key_str
+    return best
+
 
 @st.cache_data(show_spinner=False, max_entries=1200)
 def get_retailer_bundle(retailer_name, retail_url, target_rpc="", sku="", row_source_digest=""):
@@ -12374,6 +12561,29 @@ def finalize_salsify_copy_for_retailer(retailer_name, s_text):
             out[f"feature{i}"] = selected_features[i - 1] if i - 1 < len(selected_features) else ""
         return out
 
+    if retailer == "albertsons":
+        alb_override = retailer_overrides.get("albertsons", {}) or {}
+        selected_title = first_non_placeholder_copy_value(alb_override.get("title", ""), out.get("title", ""))
+        selected_description = first_non_placeholder_copy_value(alb_override.get("description", ""), out.get("description", ""))
+        alb_slots = alb_override.get("feature_slots", {}) or {}
+        selected_features = []
+        for i in range(1, 11):
+            slot_value = first_non_placeholder_copy_value(alb_slots.get(i, ""))
+            if slot_value:
+                selected_features.append(slot_value)
+        if not selected_features:
+            selected_features = normalize_salsify_feature_values(alb_override.get("features", []) or generic_feature_list(), max_features=10)
+        else:
+            selected_features = dedupe_preserve_order(
+                selected_features + normalize_salsify_feature_values(alb_override.get("features", []), max_features=10)
+            )[:10]
+        out["title"] = selected_title
+        out["description"] = selected_description
+        out["features"] = selected_features
+        for i in range(1, 11):
+            out[f"feature{i}"] = selected_features[i - 1] if i - 1 < len(selected_features) else ""
+        return out
+
     if retailer == "heb":
         heb_override = retailer_overrides.get("heb", {}) or {}
         selected_title = clean_heb_title(first_non_placeholder_copy_value(heb_override.get("title", ""), out.get("title", "")))
@@ -12522,6 +12732,14 @@ def finalize_retailer_copy(retailer_name, r_text):
             out.get("features", []),
             max_features=5,
         )
+        return out
+
+    if retailer == "albertsons":
+        out["title"] = normalize_space(out.get("title", ""))
+        out["description"] = normalize_space(out.get("description", ""))
+        out["features"] = dedupe_preserve_order(
+            [normalize_space(x) for x in (out.get("features", []) or []) if normalize_space(x)]
+        )[:10]
         return out
 
     if retailer == "heb":
@@ -13522,7 +13740,7 @@ def get_visual_row_payload(
                 retail_url,
                 target_rpc=current_target_sku,
             )
-    elif retailer_norm in {"heb", "cvs"}:
+    elif retailer_norm in {"heb", "cvs", "albertsons"}:
         if not row_source_code:
             row_source_code = lookup_uploaded_raw_html(
                 uploaded_html_map,
@@ -13862,6 +14080,20 @@ def process_row(row):
                 status_notes.append("CVS uploaded source matched but copy parser found no live copy")
             if not r_has_images:
                 status_notes.append("CVS retailer images missing from selected CVS source paths")
+
+        if retailer_norm_for_row == "albertsons":
+            r_has_copy = bool(
+                normalize_space(r_text.get("title", ""))
+                or normalize_space(r_text.get("description", ""))
+                or any(normalize_space(x) for x in (r_text.get("features", []) or []))
+            )
+            r_has_images = bool(any(str(x or "").strip() for x in (r_images or [])))
+            if not r_has_copy and not row_source_code:
+                status_notes.append("Albertsons capture missing/unmatched and live fetch returned nothing - upload the extension capture")
+            elif not r_has_copy and row_source_code:
+                status_notes.append("Albertsons capture matched but parser found no copy")
+            if not r_has_images:
+                status_notes.append("Albertsons retailer images missing from selected source")
 
         debug_data = r_text.get("debug", {})
 
@@ -14493,6 +14725,11 @@ if uploaded_file:
                 elif selected_retailer == "Kroger":
                     retailer_df["retail_url"] = retailer_df.apply(
                         lambda row: row["retail_url"] if str(row.get("retail_url", "")).strip() else find_kroger_url_in_uploaded_map(uploaded_raw_html_map, target_rpc=row.get("retailer_rpc", "")),
+                        axis=1,
+                    )
+                elif selected_retailer == "Albertsons":
+                    retailer_df["retail_url"] = retailer_df.apply(
+                        lambda row: row["retail_url"] if str(row.get("retail_url", "")).strip() else find_albertsons_url_in_uploaded_map(uploaded_raw_html_map, target_rpc=row.get("retailer_rpc", "")),
                         axis=1,
                     )
 
