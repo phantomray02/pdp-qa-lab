@@ -4925,14 +4925,40 @@ def _parse_salsify_page(html_text):
                     return clean_value
         return ""
 
+    def albertsons_real_value(required_tokens, excluded_tokens=()):
+        """First real value on an Albertsons property (e.g. 'Albertsons Product Title (Each)').
+        Salsify nodes can list the property label ahead of the value, so skip label/placeholder text."""
+        for prop_key, values in property_values.items():
+            pk = normalize_space(prop_key).lower().replace("_", " ")
+            if "albertsons" not in pk:
+                continue
+            if not all(tok in pk for tok in required_tokens):
+                continue
+            if any(tok in pk for tok in excluded_tokens):
+                continue
+            for value in values or []:
+                clean_value = normalize_space(value)
+                if clean_value and not is_placeholder_salsify_copy_value(clean_value) and normalize_salsify_asset_name(clean_value) != normalize_salsify_asset_name(prop_key):
+                    return clean_value
+        return ""
+
+    def general_real_value(*keys):
+        """First real value on an exact General property, skipping label/placeholder text."""
+        for value in collect_property_values(*keys):
+            clean_value = normalize_space(value)
+            if clean_value and not is_placeholder_salsify_copy_value(clean_value):
+                return clean_value
+        return ""
+
     albertsons_title = first_non_placeholder_copy_value(
-        first_property("Albertsons Product Title", "Albertsons Title", "Albertsons Product Name"),
-        first_property("General Product Title", "General Title", "Product Title"),
+        albertsons_real_value(("title",), ("meta", "seo", "subtitle", "sub title")),
+        albertsons_real_value(("product", "name"), ("meta", "seo")),
+        general_real_value("General Product Title", "General Title", "Product Title"),
         scan_non_placeholder_value("title", other_retailer_tokens + ("meta", "seo", "subtitle")),
     )
     albertsons_description = first_non_placeholder_copy_value(
-        first_property("Albertsons Description", "Albertsons Product Description", "Albertsons Long Description"),
-        first_property("General Description", "General Product Description", "Description"),
+        albertsons_real_value(("description",), ("meta", "seo", "short", "image", "alt")),
+        general_real_value("General Description", "General Product Description", "Description"),
         scan_non_placeholder_value("description", other_retailer_tokens + ("meta", "seo", "short", "image", "alt")),
     )
 
@@ -12442,6 +12468,11 @@ def is_placeholder_salsify_copy_value(value):
     if re.fullmatch(r"cvs bullet ?\d+", normalized):
         return True
     if re.fullmatch(r"bullet ?\d+", normalized):
+        return True
+    # Albertsons-only: property labels such as "Albertsons Product Title (Each)" or "Albertsons Feature 1".
+    if re.fullmatch(r"albertsons (?:product )?(?:title|description|name)(?: each)?", normalized):
+        return True
+    if re.fullmatch(r"albertsons (?:feature|bullet) ?\d+(?: each)?", normalized):
         return True
     return False
 
